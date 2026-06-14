@@ -1,0 +1,470 @@
+---
+title: "snp-gene-assoc"
+output: html_document
+date: "2026-06-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  eval    = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+------------------------------------------------------------------------
+
+# Overview
+
+This SOP documents the full analysis pipeline for candidate gene SNP
+association analysis in livestock using a Fluidigm/Agena targeted SNP
+panel. The pipeline covers genotype quality control, genetic diversity
+estimation, population structure analysis, and SNP-trait association
+analysis.
+
+**Study design:**
+
+| Item | Description |
+|------------------------------------|------------------------------------|
+| Animals | n = 89–92 (varies by available phenotype) |
+| Breeds | KK, KK Elite (KKE), Nellore |
+| Locations | PTH Jelai NS, PTH Tersat Terengganu, PTH Ulu Lepar Pahang, MARDI Kemaman Terengganu |
+| Genotyping platform | Fluidigm 96.96 Dynamic Array |
+| SNPs | 33 high-quality polymorphic SNPs (post-QC) |
+| Traits | BW0, WW205, BW12, ADG_0-6, ADG_6-12, RGR |
+
+------------------------------------------------------------------------
+
+# Pipeline Flowchart
+
+```text
+Raw genotype data (HapMap .txt)
+  ┌───────────────┐
+  │   snpReady    │  → MAF filter & QC
+  │               │  → Encode genotype to 0/1/2
+  └───────┬───────┘  → HWE, Ho, He, MAF, PIC
+          │
+          ▼
+  ┌───────────────┐
+  │    TASSEL     │  → View and validate HapMap format
+  │               │  → Run GLM/MLM association (optional)
+  └───────┬───────┘
+          │
+          ▼
+  ┌───────────────┐
+  │   OmicsBox    │  → PCA 
+  │               │  → FST 
+  └───────┬───────┘
+          │ 
+          ▼
+  ┌───────────────┐
+  │  R (custom)   │  → Phenotype cleaning & trait calculation
+  │               │  → GLM association: y ~ SNP + breed + location
+  │               │  → Genotype & allele frequency
+  │               │  → PCA plot (ggplot2)
+  └───────┬───────┘
+          │
+          ▼
+      OUTPUTS
+  ─────────────────
+  • Association results (.csv / .xlsx)
+  • PCA plot (.png)
+  • Genotype & allele frequency table (.csv / .xlsx)
+  • HWE / diversity stats table
+```
+
+------------------------------------------------------------------------
+
+# Required R Packages
+
+```{r packages}
+# Install if not already installed
+pkgs <- c("snpReady", "tidyverse", "ggrepel", "writexl")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(snpReady)
+library(tidyverse)
+library(ggrepel)
+library(writexl)
+```
+
+------------------------------------------------------------------------
+
+# Input Data
+
+## Genotype File (HapMap format)
+
+**File:** `geno_to_assoc.txt`\
+**Format:** Tab-delimited text file, HapMap standard\
+**Expected structure:**
+
+| Column     | Content                           | Example     |
+|------------|-----------------------------------|-------------|
+| 1 — rs     | SNP ID                            | rs108968214 |
+| 2 — allele | Ref/Alt allele                    | C/G         |
+| 3 — chrom  | Chromosome                        | 24          |
+| 4 — pos    | Position (bp)                     | 59164671    |
+| 5–11       | Metadata (strand, assembly, etc.) | NA          |
+| 12 onwards | Animal genotypes (2-char codes)   | CC, CG, GG  |
+
+**Genotype coding:**
+
+| Code              | Meaning      |
+|-------------------|--------------|
+| CC / GG / TT / AA | Homozygous   |
+| CG / AC / GT etc. | Heterozygous |
+| NN / --           | Missing      |
+
+> **Note:** Monomorphic SNPs (single allele format in column 2, e.g. `G`
+> instead of `C/G`) are removed during QC. These represent SNPs with no
+> variation in the population.
+
+------------------------------------------------------------------------
+
+## Phenotype File
+
+**File:** `pheno_to_assoc.txt`\
+**Format:** Tab-delimited text file\
+**Expected columns:**
+
+| Column | Content | Notes |
+|------------------------|------------------------|------------------------|
+| animalID | Animal identifier | Must match exactly with HapMap sample IDs |
+| breed | Breed name | KK, KKE, Nellore |
+| location | Station name | PTH Jelai NS, PTH Tersat Terengganu, etc. |
+| BW0 | Birth weight (kg) | True birth weight |
+| BW6 | 6-month weight (kg) | 0 = missing → converted to NA |
+| BW12 | 12-month / yearling weight (kg) | 0 = missing → converted to NA |
+| WW205 | 205-day adjusted weaning weight (kg) | Pre-calculated |
+| ADG_0_6 | Pre-weaning ADG (kg/day) | Pre-calculated |
+| ADG_6_12 | Post-weaning ADG (kg/day) | Pre-calculated |
+| RGR | Relative growth rate (%) | Pre-calculated |
+
+> **Important:** Missing BW6 values are coded as `0` in the raw file —
+> these must be converted to `NA` before analysis (handled in Step 2
+> below).
+
+------------------------------------------------------------------------
+
+## Growth Trait Formulae
+
+| Trait    | Formula                         | Unit   |
+|----------|---------------------------------|--------|
+| WW205    | ((BW6 − BW0) / 180) × 205 + BW0 | kg     |
+| ADG_0-6  | (BW6 − BW0) / 180               | kg/day |
+| ADG_6-12 | (BW12 − BW6) / 180              | kg/day |
+| RGR      | ((BW12 − BW0) / BW0) × 100      | \%     |
+
+> Assumed age at 6-month weighing = 180 days (BIF standard for WW205).
+
+***
+# Step 1: Genotype QC using snpReady
+
+**Input:** `geno_file` (txt format, transpose geno Animals x SNPs, breed in col2, pre-loaded in RStudio)
+**Input:** `pheno_file` (txt format, pre-loaded in RStudio)
+**Output:** `geno_coded` matrix (Animals × SNPs, coded 0/1/2)
+
+**Output files:**
+
+| File | Content |
+|---|---|
+| `Diversity_KK.csv` | Ho, He, MAF, PIC, HWE chiSq, pval for KK breed |
+| `Diversity_KKElite.csv` | Same for KK Elite |
+| `Diversity_Nellore.csv` | Same for Nellore |
+
+**Column interpretation:**
+
+| Column | Meaning | Flag if... |
+|---|---|---|
+| MAF | Minor allele frequency | < 0.01 → remove |
+| Ho | Observed heterozygosity | Ho << He → possible inbreeding |
+| He | Expected heterozygosity | — |
+| PIC | Polymorphism info content | < 0.10 → low informativeness |
+| chiSq | Chi-square for HWE | — |
+| pval | HWE p-value | < 0.05 → deviation from HWE |
+
+## Refer to "zebu_snpReady.R" to run QC & pop analysis
+
+# Step 2: TASSEL — Format Validation
+
+**Tool:** TASSEL 5 (GUI or command line)  
+**Input:** `geno_to_assoc.txt` (HapMap)  
+**Purpose:** Validate HapMap format, view genotype distribution, optional GLM/MLM run
+
+## How to load in TASSEL
+
+1. Open TASSEL
+2. `Data` → `Load` → select `geno_to_assoc.txt`
+3. Verify: correct number of SNPs and taxa loaded
+4. Check: `Data` → `Genotype Summary` — confirm MAF distribution, missing rate
+
+## Optional: Run GLM/MLM in TASSEL
+
+1. Load phenotype file (tab-delimited, first column = Taxa)
+2. `Analysis` → `Association` → `General Linear Model` or `Mixed Linear Model`
+3. Select Analysis > Relatedness > Distance Matrix
+4. Hover Distance Matrix result > Select Analysis > MDS
+5. Hover Genotype + Phenotype + MDS > Select Intersect Join
+6. Hover Intersect Join result > Select Analysis > GLM
+7. Export results as `.txt`
+
+> **Note:** TASSEL results can be used for comparison with R GLM results.
+***
+
+# Step 3: Phenotype Cleaning
+
+**Input:** `pheno_file` (pre-loaded in RStudio)\
+**Output:** Cleaned `pheno` data frame
+
+```{r pheno_clean}
+pheno <- pheno_file
+colnames(pheno)[1] <- "animalID"
+
+# Relabel KKE → KK Elite (or reverse depending on your preference)
+pheno$breed[pheno$breed == "KKE"] <- "KK Elite"
+
+# Convert zeros to NA — missing measurements coded as 0 in raw file
+for (col in c("BW6", "WW205", "ADG_0_6", "ADG_6_12")) {
+  pheno[[col]][pheno[[col]] == 0] <- NA
+}
+pheno$BW12[pheno$BW12 == 0] <- NA
+pheno$RGR[pheno$RGR   == 0] <- NA
+
+# Factor breed and location
+pheno$breed    <- factor(pheno$breed, levels = c("KK", "KK Elite", "Nellore"))
+pheno$location <- factor(pheno$location)
+
+# Remove specific animals if needed
+# pheno <- pheno %>% filter(!animalID %in% c("WKKAM43", "UNAN39", "UNAM55"))
+
+# Check
+cat("Animals per breed:\n")
+print(table(pheno$breed))
+cat("\nValid n per trait:\n")
+pheno %>%
+  select(BW0, WW205, BW12, ADG_0_6, ADG_6_12, RGR) %>%
+  summarise(across(everything(), ~sum(!is.na(.)))) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+```{r impute}
+# Impute missing with SNP mean (if any remaining)
+cat(sprintf("Missing genotypes: %d\n", sum(is.na(geno_coded))))
+geno_coded <- t(apply(geno_coded, 1, function(x) {
+  x[is.na(x)] <- round(mean(x, na.rm = TRUE)); x
+}))
+
+cat(sprintf("SNPs available: %d\n", nrow(geno_coded)))
+```
+
+------------------------------------------------------------------------
+
+# Step 6: GLM Association Analysis
+
+**Model:** `y ~ SNP + breed + location`\
+**Input:** `pheno` (cleaned), `geno_coded` (Animals × SNPs) in 0,1,2
+formatted by snpReady **Output:** `LM_results.csv`, `LM_results.xlsx`
+
+```{r association}
+traits <- c("BW0", "WW205", "BW12", "ADG_0_6", "ADG_6_12", "RGR")
+
+# Match animals
+common   <- intersect(pheno$animalID, colnames(geno_coded))
+pheno_m  <- pheno %>% filter(animalID %in% common) %>% arrange(animalID)
+geno_m   <- geno_coded[, sort(common), drop = FALSE]
+stopifnot(all(pheno_m$animalID == colnames(geno_m)))
+
+n_snp   <- nrow(geno_m)
+results <- list()
+
+for (trait in traits) {
+
+  y_raw   <- pheno_m[[trait]]
+  valid   <- !is.na(y_raw)
+  n_valid <- sum(valid)
+  cat(sprintf("%-12s  n = %d\n", trait, n_valid))
+  if (n_valid < 15) next
+
+  # Scale phenotype to mean=0, sd=1
+  y         <- scale(y_raw[valid])[, 1]
+  pheno_sub <- pheno_m[valid, ]
+  geno_sub  <- geno_m[, valid, drop = FALSE]
+
+  res <- data.frame(
+    Trait = trait,
+    SNP   = rownames(geno_m),
+    beta  = NA_real_, SE = NA_real_,
+    t     = NA_real_, p  = NA_real_,
+    stringsAsFactors = FALSE
+  )
+
+  for (s in seq_len(n_snp)) {
+    snp_vec <- as.numeric(geno_sub[s, ])
+    if (length(unique(snp_vec[!is.na(snp_vec)])) < 2) next
+    fit <- tryCatch(
+      lm(y ~ snp_vec + breed + location,
+         data = data.frame(y        = y,
+                           snp_vec  = snp_vec,
+                           breed    = pheno_sub$breed,
+                           location = pheno_sub$location)),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) next
+    cf <- summary(fit)$coefficients
+    if (!"snp_vec" %in% rownames(cf)) next
+    res$beta[s] <- round(cf["snp_vec", "Estimate"],   4)
+    res$SE[s]   <- round(cf["snp_vec", "Std. Error"], 4)
+    res$t[s]    <- round(cf["snp_vec", "t value"],    4)
+    res$p[s]    <- round(cf["snp_vec", "Pr(>|t|)"],   6)
+  }
+
+  results[[trait]] <- res %>% arrange(p)
+}
+
+master <- bind_rows(results)
+
+# Significant hits
+cat("\n=== SNPs with p < 0.05 ===\n")
+print(master %>% filter(p <= 0.05) %>% arrange(p))
+
+# Save
+write.csv(master, "LM_results.csv", row.names = FALSE)
+write_xlsx(list("All results" = master,
+                "p < 0.05"   = master %>% filter(p <= 0.05)),
+           "LM_results.xlsx")
+cat("Saved: LM_results.csv, LM_results.xlsx\n")
+```
+
+**Result columns:**
+
+| Column | Meaning                                          |
+|--------|--------------------------------------------------|
+| Trait  | Growth trait name                                |
+| SNP    | SNP rs ID                                        |
+| beta   | Effect size (in SD units — phenotype was scaled) |
+| SE     | Standard error of beta                           |
+| t      | t-statistic                                      |
+| p      | p-value (nominal)                                |
+
+> **Multiple testing:** FDR and Bonferroni correction are not applied
+> here — compute separately using `p.adjust(master$p, method = "BH")`
+> and `p.adjust(master$p, method = "bonferroni")`.
+
+**Effect size interpretation (beta in SD units):**
+
+|           | beta     |
+|-----------|----------|
+| \< 0.2    | Small    |
+| 0.2 – 0.5 | Moderate |
+| \> 0.5    | Large    |
+
+------------------------------------------------------------------------
+
+# Step 7: Genotype and Allele Frequency
+
+**Input:** `geno_coded` (Animals × SNPs), `pheno` (with breed info)\
+**Output:** `Geno_Allele_Frequency.csv`, `Geno_Allele_Frequency.xlsx`
+
+```{r freq}
+# Define SNPs of interest — replace with your actual significant SNP IDs
+snps_of_interest <- c("SNP1", "SNP2", "SNP3", "SNP4", "SNP5")
+
+# Subset
+geno_sub <- t(geno_coded)[, snps_of_interest, drop = FALSE]
+# geno_sub is now Animals × SNPs
+
+freq_results <- list()
+
+for (snp in snps_of_interest) {
+  for (breed in levels(pheno$breed)) {
+    idx    <- pheno$breed == breed
+    geno_b <- geno_sub[idx, snp]
+    n      <- sum(!is.na(geno_b))
+    if (n == 0) next
+
+    n_AA <- sum(geno_b == 0, na.rm = TRUE)
+    n_AB <- sum(geno_b == 1, na.rm = TRUE)
+    n_BB <- sum(geno_b == 2, na.rm = TRUE)
+
+    freq_results[[paste(snp, breed)]] <- data.frame(
+      SNP          = snp,
+      Breed        = breed,
+      N            = n,
+      n_HomRef     = n_AA,
+      n_Het        = n_AB,
+      n_HomAlt     = n_BB,
+      Freq_HomRef  = round(n_AA / n, 4),
+      Freq_Het     = round(n_AB / n, 4),
+      Freq_HomAlt  = round(n_BB / n, 4),
+      Freq_Ref     = round((2*n_AA + n_AB) / (2*n), 4),
+      Freq_Alt     = round((2*n_BB + n_AB) / (2*n), 4)
+    )
+  }
+}
+
+freq_table <- bind_rows(freq_results)
+print(freq_table)
+
+write.csv(freq_table, "Geno_Allele_Frequency.csv", row.names = FALSE)
+write_xlsx(list("Frequency Table" = freq_table),
+           "Geno_Allele_Frequency.xlsx")
+cat("Saved: Geno_Allele_Frequency.csv\n")
+```
+
+**Output columns:**
+
+| Column | Meaning |
+|----|----|
+| N | Total animals in breed with genotype data |
+| n_HomRef | Count of homozygous reference (0) |
+| n_Het | Count of heterozygous (1) |
+| n_HomAlt | Count of homozygous alternate (2) |
+| Freq_HomRef / Het / HomAlt | Genotype frequencies (sum = 1.0) |
+| Freq_Ref | Reference allele frequency |
+| Freq_Alt | Alternate allele frequency (Freq_Ref + Freq_Alt = 1.0) |
+
+------------------------------------------------------------------------
+
+# Output Summary
+
+| Step | Tool | Output file | Content |
+|------------------|------------------|------------------|------------------|
+| 4 | snpReady | `Diversity_KK.csv` | Ho, He, MAF, PIC, HWE per SNP — KK |
+| 4 | snpReady | `Diversity_KKElite.csv` | Same for KK Elite |
+| 4 | snpReady | `Diversity_Nellore.csv` | Same for Nellore |
+| 5 | R (ggplot2) | `PCA_breed.png` | PCA plot coloured by breed |
+| 6 | R (lm) | `LM_results.csv` | Full GLM association results |
+| 6 | R (lm) | `LM_results.xlsx` | GLM results (2 sheets) |
+| 7 | R | `Geno_Allele_Frequency.csv` | Genotype & allele freq for significant SNPs |
+| 7 | R | `Geno_Allele_Frequency.xlsx` | Same, Excel format |
+
+------------------------------------------------------------------------
+
+# Common Issues and Fixes
+
+| Error | Cause | Fix |
+|------------------------|------------------------|------------------------|
+| `rownames(geno_sub) != pheno$animalID` | Animal order mismatch | Sort both by animalID before matching |
+| `invalid factor level, NA generated` | Editing factor column directly | Convert to character first: `as.character()` then relabel then `factor()` |
+| `snp_vec not in rownames(cf)` | SNP monomorphic after subsetting | Skip — no variation to test |
+| All results NA | geno orientation wrong (SNPs × Animals instead of Animals × SNPs) | Transpose: `geno_coded <- t(geno_coded)` |
+| Zero → not NA | Missing BW6 coded as 0 in raw file | Apply zero-to-NA conversion in Step 2 |
+
+------------------------------------------------------------------------
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
+
+------------------------------------------------------------------------
+
+*SOP prepared by ruruadra & claude*\
+*Last updated: `r Sys.Date()`*
+
+
